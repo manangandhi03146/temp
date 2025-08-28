@@ -1,0 +1,198 @@
+import os
+import time
+import threading
+import requests
+import pandas as pd
+
+USPS_URL  = "https://apis.usps.com/addresses/v3/address"
+TOKEN_URL = "https://apis.usps.com/oauth2/v3/token"
+
+# --- Config via env ---
+# Option A: static access token (skip OAuth if set)
+STATIC_TOKEN = os.environ.get("USPS_ACCESS_TOKEN", "").strip()
+# Option B: OAuth (auto-refresh ~every 8h)
+CID  = os.environ.get("USPS_CLIENT_ID", "").strip()
+CSEC = os.environ.get("USPS_CLIENT_SECRET", "").strip()
+RFT  = os.environ.get("USPS_REFRESH_TOKEN", "").strip()  # optional but preferred
+
+INPUT_CSV  = os.environ.get("INPUT_CSV", "input_addresses.csv")
+OUTPUT_CSV = os.environ.get("OUTPUT_CSV", "output_addresses_cleaned.csv")
+
+# --- Token mgmt ---
+TOKEN = None
+EXPIRES_AT = 0
+
+def _fetch_token():
+    """Obtain new access token (prefer refresh_token; otherwise client_credentials)."""
+    global TOKEN, EXPIRES_AT
+    if RFT:
+        payload = {
+            "grant_type": "refresh_token",
+            "client_id": CID,
+            "client_secret": CSEC,
+            "refresh_token": RFT,
+        }
+    else:
+        payload = {
+            "grant_type": "client_credentials",
+            "client_id": CID,
+            "client_secret": CSEC,
+        }
+    r = requests.post(TOKEN_URL, json=payload, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    TOKEN = data["access_token"]
+    ttl = int(data.get("expires_in", 8 * 3600))
+    EXPIRES_AT = time.time() + max(60, ttl - 120)  # refresh ~2 minutes early
+
+def _get_token():
+    if STATIC_TOKEN:
+        return STATIC_TOKEN
+    if not TOKEN or time.time() >= EXPIRES_AT:
+        _fetch_token()
+    return TOKEN
+
+def _start_token_refresher():
+    if STATIC_TOKEN:
+        return
+    def _loop():
+        while True:
+            sleep_for = max(60, int(EXPIRES_AT - time.time()) if EXPIRES_AT else 8*3600 - 120)
+            time.sleep(sleep_for)
+            try:
+                _fetch_token()
+            except Exception:
+                time.sleep(60)  # brief retry
+    threading.Thread(target=_loop, daemon=True).start()
+
+# --- USPS helpers ---
+def dpv_code(res):
+    """Return DPV code (Y/D/S/N) regardless of casing/path; else None."""
+    if not isinstance(res, dict):
+        return None
+    parents = ["additionalInfo", "additional_info", "addressMetadata", "metadata"]
+    keys = ["DPVConfirmation", "dpvConfirmation", "dpv_confirmation"]
+    for p in parents:
+        info = res.get(p)
+        if isinstance(info, dict):
+            for k in keys:
+                if k in info and info[k] is not None:
+                    return str(info[k]).upper()
+    for k in keys:
+        if k in res and res[k] is not None:
+            return str(res[k]).upper()
+    return None
+
+def assess_accuracy(res, orig_a2=""):
+    """
+    Return (is_confident: bool, reason: str).
+    Confident = DPV=Y (primary+secondary confirmed).
+    """
+    if not isinstance(res, dict):
+        return (False, "no_response")
+    code = (dpv_code(res) or "")
+    addr = res.get("address", {}) or {}
+    zip4 = (addr.get("ZIPPlus4") or "").strip()
+    sec  = (addr.get("secondaryAddress") or "").strip()
+
+    if code == "Y":
+        return (True, "DPV=Y (primary+secondary confirmed)")
+    if code == "D":
+        return (False, "DPV=D (unit missing)" + ("; has ZIP+4" if zip4 else ""))
+    if code == "S":
+        changed = bool(orig_a2 and not sec)
+        return (False, "DPV=S (unit present but unconfirmed)" + ("; secondary dropped" if changed else ""))
+    if code == "N":
+        return (False, "DPV=N (not deliverable)")
+    return (False, "no_dpv_code")
+
+def _usps_lookup(street, secondary=None, city="", state="", zip5="", zip4=None):
+    """Single GET to USPS. Return JSON on success; None on 400/other failures."""
+    if not street:
+        return None
+    try:
+        token = _get_token()
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        params = {
+            "streetAddress": street.strip(),
+            **({"secondaryAddress": secondary.strip()} if secondary else {}),
+            **({"city": city.strip()} if city else {}),
+            **({"state": state.strip()} if state else {}),
+            **({"ZIPCode": str(zip5).strip()} if zip5 else {}),
+            **({"ZIPPlus4": str(zip4).strip()} if zip4 else {}),
+        }
+        r = requests.get(USPS_URL, params=params, headers=headers, timeout=15)
+        if r.status_code == 400:
+            return None
+        return r.json() if r.ok else None
+    except requests.RequestException:
+        return None
+
+def _apply_res(row, res):
+    """Write standardized fields back to the row (USPS is usually uppercase)."""
+    a = (res or {}).get("address", {}) or {}
+    row["address1"] = a.get("streetAddress", row.get("address1",""))
+    row["address2"] = a.get("secondaryAddress", "")
+    row["city"]     = a.get("city", row.get("city",""))
+    row["state"]    = a.get("state", row.get("state",""))
+    row["zip"]      = a.get("ZIPCode", row.get("zip","")) or ""
+    if "zip4" in row.index:
+        row["zip4"] = a.get("ZIPPlus4", "") or ""
+    return row
+
+def _process_row(row):
+    """Try address1(+address2); else address2; else uppercase both. Set _debug."""
+    a1 = (row.get("address1") or "").strip()
+    a2 = (row.get("address2") or "").strip()
+    city = (row.get("city") or "").strip()
+    state = (row.get("state") or "").strip()
+    zip5 = (row.get("zip") or "").strip()
+    zip4 = (row.get("zip4") or "").strip() if "zip4" in row.index else None
+
+    r1 = _usps_lookup(a1, a2 or None, city, state, zip5, zip4)
+    ok1, why1 = assess_accuracy(r1, orig_a2=a2)
+    if ok1:
+        row = _apply_res(row, r1)
+        row["_debug"] = f"USPS_OK ({why1}) dpv={dpv_code(r1)}"
+        return row
+
+    r2 = _usps_lookup(a2, None, city, state, zip5, zip4) if a2 else None
+    ok2, why2 = assess_accuracy(r2, orig_a2="")
+    if ok2:
+        row = _apply_res(row, r2)
+        row["_debug"] = f"USPS_OK_FROM_A2 ({why2}) dpv={dpv_code(r2)}"
+        return row
+
+    # fallback
+    row["address1"] = a1.upper()
+    row["address2"] = a2.upper()
+    row["_debug"] = f"FALLBACK_UPPER ({why1} | {why2})"
+    return row
+
+# --- Main ---
+if __name__ == "__main__":
+    # Start OAuth refresher if needed
+    if not STATIC_TOKEN:
+        if not (CID and CSEC):
+            raise SystemExit("Missing USPS_CLIENT_ID/USPS_CLIENT_SECRET or USPS_ACCESS_TOKEN.")
+        _fetch_token()           # prime once
+        _start_token_refresher() # refresh in background
+
+    # Load, ensure required cols, add debug col, process, save
+    df = pd.read_csv(INPUT_CSV, dtype=str).fillna("")
+    for c in ("address1", "address2"):
+        if c not in df.columns:
+            df[c] = ""
+    if "_debug" not in df.columns:
+        df["_debug"] = ""  # force-create so you can always see it
+
+    df = df.apply(_process_row, axis=1)
+
+    # Optional: quick counts to sanity-check flow
+    try:
+        print(df["_debug"].value_counts(dropna=False))
+    except Exception:
+        pass
+
+    df.to_csv(OUTPUT_CSV, index=False)
+    print(f"Done. Wrote {OUTPUT_CSV}")
