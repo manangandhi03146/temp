@@ -175,4 +175,3 @@ output_html_file='addresses.html'
 with open(output_html_file, 'w') as f:
     f.write(html_content)
 
-
